@@ -7,11 +7,11 @@ import {IParaSwapAugustus} from '../dependencies/paraswap/IParaSwapAugustus.sol'
 
 contract HydraAugustus is IParaSwapAugustus {
     using SafeERC20 for IERC20;
-    address public constant DISPATCH_PRECOMPILE = 0x0000000000000000000000000000000000000401;
+
+    address public immutable DISPATCH;
 
     uint256 internal constant SCALE_FIRST_AMOUNT_OFFSET = 10;
     uint256 internal constant SCALE_SECOND_AMOUNT_OFFSET = 26;
-    uint256 internal constant SCALE_AMOUNT_SIZE = 16;
     uint256 internal constant MIN_DISPATCH_DATA_LENGTH = 42;
     uint256 internal constant MAX_UINT128 = type(uint128).max;
 
@@ -28,6 +28,11 @@ contract HydraAugustus is IParaSwapAugustus {
         uint256 amountIn,
         uint256 amountOut
     );
+
+    constructor(address dispatch) {
+        require(dispatch != address(0), 'ZERO_DISPATCH');
+        DISPATCH = dispatch;
+    }
 
     function getTokenTransferProxy() external view override returns (address) {
         return address(this);
@@ -49,9 +54,10 @@ contract HydraAugustus is IParaSwapAugustus {
 
         uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
 
-        bytes memory data = _patchAmounts(dispatchData, amountIn, minAmountOut);
+        IERC20(tokenIn).safeApprove(DISPATCH, 0);
+        IERC20(tokenIn).safeApprove(DISPATCH, amountIn);
 
-        _dispatch(data);
+        _dispatch(_patchAmounts(dispatchData, amountIn, minAmountOut));
 
         amountOut = IERC20(tokenOut).balanceOf(address(this)) - balanceBefore;
         require(amountOut >= minAmountOut, 'INSUFFICIENT_OUTPUT');
@@ -77,6 +83,9 @@ contract HydraAugustus is IParaSwapAugustus {
 
         uint256 balanceInBefore = IERC20(tokenIn).balanceOf(address(this));
         uint256 balanceOutBefore = IERC20(tokenOut).balanceOf(address(this));
+
+        IERC20(tokenIn).safeApprove(DISPATCH, 0);
+        IERC20(tokenIn).safeApprove(DISPATCH, maxAmountIn);
 
         _dispatch(_patchAmounts(dispatchData, amountOut, maxAmountIn));
 
@@ -147,7 +156,7 @@ contract HydraAugustus is IParaSwapAugustus {
     }
 
     function _dispatch(bytes memory data) internal {
-        (bool success, bytes memory returnData) = DISPATCH_PRECOMPILE.call(data);
+        (bool success, bytes memory returnData) = DISPATCH.call(data);
         if (!success) {
             assembly {
                 revert(add(returnData, 32), mload(returnData))
