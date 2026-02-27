@@ -68,7 +68,7 @@ abstract contract ParaSwapDebtSwapAdapter is
     CreditDelegationInput memory creditDelegationPermit,
     PermitInput memory collateralATokenPermit
   ) external {
-    uint256 excessBefore = IERC20Detailed(debtSwapParams.newDebtAsset).balanceOf(address(this));
+    uint256 excessBefore = _safeBalanceOf(debtSwapParams.newDebtAsset, address(this));
     // delegate credit
     if (creditDelegationPermit.deadline != 0) {
       ICreditDelegationToken(creditDelegationPermit.debtToken).delegationWithSig(
@@ -129,7 +129,7 @@ abstract contract ParaSwapDebtSwapAdapter is
     }
 
     // use excess to repay parts of flash debt
-    uint256 excessAfter = IERC20Detailed(debtSwapParams.newDebtAsset).balanceOf(address(this));
+    uint256 excessAfter = _safeBalanceOf(debtSwapParams.newDebtAsset, address(this));
     // with wrapped flashloans there is the chance of 1 wei inaccuracy on transfer & withdrawal
     // this might lead to a slight excess decrease
     uint256 excess = excessAfter > excessBefore ? excessAfter - excessBefore : 0;

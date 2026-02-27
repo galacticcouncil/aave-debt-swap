@@ -43,7 +43,8 @@ abstract contract BaseParaSwapAdapter is Ownable, IBaseParaSwapAdapter {
 
   /// @inheritdoc IBaseParaSwapAdapter
   function rescueTokens(IERC20 token) external onlyOwner {
-    token.safeTransfer(owner(), token.balanceOf(address(this)));
+    uint256 balance = _safeBalanceOf(address(token), address(this));
+    _safeTransferToken(address(token), owner(), balance);
   }
 
   /**
@@ -149,6 +150,67 @@ abstract contract BaseParaSwapAdapter is Ownable, IBaseParaSwapAdapter {
     require(
       success && (returndata.length == 0 || abi.decode(returndata, (bool))),
       'APPROVE_FAILED'
+    );
+  }
+
+  /**
+   * @dev Get the balance of a token using a low-level call, bypassing the isContract check.
+   * @param token The address of the token
+   * @param account The address to query the balance of
+   * @return balance The token balance
+   */
+  function _safeBalanceOf(address token, address account) internal view returns (uint256 balance) {
+    (bool success, bytes memory returndata) = token.staticcall(
+      abi.encodeWithSelector(IERC20.balanceOf.selector, account)
+    );
+    require(success && returndata.length >= 32, 'BALANCE_OF_FAILED');
+    balance = abi.decode(returndata, (uint256));
+  }
+
+  /**
+   * @dev Get the decimals of a token using a low-level call, bypassing the isContract check.
+   * @param token The address of the token
+   * @return decimals The number of decimals
+   */
+  function _safeTokenDecimals(address token) internal view returns (uint8 decimals) {
+    (bool success, bytes memory returndata) = token.staticcall(
+      abi.encodeWithSelector(IERC20Detailed.decimals.selector)
+    );
+    require(success && returndata.length >= 32, 'DECIMALS_FAILED');
+    decimals = abi.decode(returndata, (uint8));
+    require(decimals <= 77, 'TOO_MANY_DECIMALS_ON_TOKEN');
+  }
+
+  /**
+   * @dev Low-level transfer bypassing isContract check for substrate precompile tokens.
+   * @param token The address of the token
+   * @param to The recipient address
+   * @param amount The amount to transfer
+   */
+  function _safeTransferToken(address token, address to, uint256 amount) internal {
+    (bool success, bytes memory returndata) = token.call(
+      abi.encodeWithSelector(IERC20.transfer.selector, to, amount)
+    );
+    require(
+      success && (returndata.length == 0 || abi.decode(returndata, (bool))),
+      'TRANSFER_FAILED'
+    );
+  }
+
+  /**
+   * @dev Low-level transferFrom bypassing isContract check for substrate precompile tokens.
+   * @param token The address of the token
+   * @param from The sender address
+   * @param to The recipient address
+   * @param amount The amount to transfer
+   */
+  function _safeTransferFromToken(address token, address from, address to, uint256 amount) internal {
+    (bool success, bytes memory returndata) = token.call(
+      abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount)
+    );
+    require(
+      success && (returndata.length == 0 || abi.decode(returndata, (bool))),
+      'TRANSFER_FROM_FAILED'
     );
   }
 }

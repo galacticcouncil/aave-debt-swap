@@ -78,13 +78,11 @@ abstract contract ParaSwapRepayAdapter is
 
     // true if flashloan is needed to repay the debt
     if (!repayParams.withFlashLoan) {
-      uint256 collateralBalanceBefore = IERC20(repayParams.collateralAsset).balanceOf(
-        address(this)
-      );
+      uint256 collateralBalanceBefore = _safeBalanceOf(repayParams.collateralAsset, address(this));
       _swapAndRepay(repayParams, collateralATokenPermit);
 
       // Supply on behalf of the user in case of excess of collateral asset after the swap
-      uint256 collateralBalanceAfter = IERC20(repayParams.collateralAsset).balanceOf(address(this));
+      uint256 collateralBalanceAfter = _safeBalanceOf(repayParams.collateralAsset, address(this));
       uint256 collateralExcess = collateralBalanceAfter > collateralBalanceBefore
         ? collateralBalanceAfter - collateralBalanceBefore
         : 0;

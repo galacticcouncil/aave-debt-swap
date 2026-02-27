@@ -69,14 +69,14 @@ contract HydraAugustus is IParaSwapAugustus {
 
         _safeTransferFrom(tokenIn, msg.sender, address(this), amountIn);
 
-        uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
+        uint256 balanceBefore = _safeBalanceOf(tokenOut, address(this));
 
         _safeApprove(tokenIn, DISPATCH, 0);
         _safeApprove(tokenIn, DISPATCH, amountIn);
 
         _dispatch(_patchAmounts(dispatchData, amountIn, minAmountOut));
 
-        amountOut = IERC20(tokenOut).balanceOf(address(this)) - balanceBefore;
+        amountOut = _safeBalanceOf(tokenOut, address(this)) - balanceBefore;
         require(amountOut >= minAmountOut, 'INSUFFICIENT_OUTPUT');
 
         _safeTransfer(tokenOut, msg.sender, amountOut);
@@ -108,16 +108,16 @@ contract HydraAugustus is IParaSwapAugustus {
 
         _safeTransferFrom(tokenIn, msg.sender, address(this), maxAmountIn);
 
-        uint256 balanceInBefore = IERC20(tokenIn).balanceOf(address(this));
-        uint256 balanceOutBefore = IERC20(tokenOut).balanceOf(address(this));
+        uint256 balanceInBefore = _safeBalanceOf(tokenIn, address(this));
+        uint256 balanceOutBefore = _safeBalanceOf(tokenOut, address(this));
 
         _safeApprove(tokenIn, DISPATCH, 0);
         _safeApprove(tokenIn, DISPATCH, maxAmountIn);
 
         _dispatch(_patchAmounts(dispatchData, amountOut, maxAmountIn));
 
-        amountIn = balanceInBefore - IERC20(tokenIn).balanceOf(address(this));
-        uint256 received = IERC20(tokenOut).balanceOf(address(this)) - balanceOutBefore;
+        amountIn = balanceInBefore - _safeBalanceOf(tokenIn, address(this));
+        uint256 received = _safeBalanceOf(tokenOut, address(this)) - balanceOutBefore;
 
         require(received >= amountOut, 'INSUFFICIENT_OUTPUT');
 
@@ -195,6 +195,15 @@ contract HydraAugustus is IParaSwapAugustus {
             mstore8(add(secondAmountPtr, 14), and(shr(112, secondAmount), 0xff))
             mstore8(add(secondAmountPtr, 15), and(shr(120, secondAmount), 0xff))
         }
+    }
+
+    /// @dev Low-level balanceOf bypassing isContract check for substrate precompile tokens
+    function _safeBalanceOf(address token, address account) internal view returns (uint256 balance) {
+        (bool success, bytes memory returndata) = token.staticcall(
+            abi.encodeWithSelector(IERC20.balanceOf.selector, account)
+        );
+        require(success && returndata.length >= 32, 'BALANCE_OF_FAILED');
+        balance = abi.decode(returndata, (uint256));
     }
 
     /// @dev Low-level approve bypassing isContract check for substrate precompile tokens

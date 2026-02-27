@@ -136,16 +136,36 @@ function buildRoute(trades: Trade[]): Buffer {
   return buf;
 }
 
-// DOT ↔ USDC via XYK multi-hop (DOT → HDX → USDC)
-const DOT_TO_USDC_ROUTE = buildRoute([
-  { poolType: POOL_TYPE.XYK, assetIn: TOKENS.DOT.id, assetOut: HDX_ID },
-  { poolType: POOL_TYPE.XYK, assetIn: HDX_ID, assetOut: TOKENS.USDC.id },
-]);
+// ── Route strategies: ordered by likelihood of liquidity ──
 
-const USDC_TO_DOT_ROUTE = buildRoute([
-  { poolType: POOL_TYPE.XYK, assetIn: TOKENS.USDC.id, assetOut: HDX_ID },
-  { poolType: POOL_TYPE.XYK, assetIn: HDX_ID, assetOut: TOKENS.DOT.id },
-]);
+interface RouteStrategy {
+  name: string;
+  dotToUsdc: Buffer;
+  usdcToDot: Buffer;
+}
+
+const ROUTE_STRATEGIES: RouteStrategy[] = [
+  {
+    name: "Omnipool",
+    dotToUsdc: buildRoute([
+      { poolType: POOL_TYPE.OMNIPOOL, assetIn: TOKENS.DOT.id, assetOut: TOKENS.USDC.id },
+    ]),
+    usdcToDot: buildRoute([
+      { poolType: POOL_TYPE.OMNIPOOL, assetIn: TOKENS.USDC.id, assetOut: TOKENS.DOT.id },
+    ]),
+  },
+  {
+    name: "XYK (DOT→HDX→USDC)",
+    dotToUsdc: buildRoute([
+      { poolType: POOL_TYPE.XYK, assetIn: TOKENS.DOT.id, assetOut: HDX_ID },
+      { poolType: POOL_TYPE.XYK, assetIn: HDX_ID, assetOut: TOKENS.USDC.id },
+    ]),
+    usdcToDot: buildRoute([
+      { poolType: POOL_TYPE.XYK, assetIn: TOKENS.USDC.id, assetOut: HDX_ID },
+      { poolType: POOL_TYPE.XYK, assetIn: HDX_ID, assetOut: TOKENS.DOT.id },
+    ]),
+  },
+];
 
 function buildSellDispatchData(
   assetInId: number,
@@ -328,6 +348,91 @@ async function submitAndWait(
   });
 }
 
+async function executeViaSudoOrGovernance(
+  api: ApiPromise,
+  signer: any,
+  batch: any,
+  label: string
+): Promise<void> {
+  const encodedCall = batch.method.toHex();
+  const encodedHash = blake2AsHex(encodedCall);
+  const encodedLen = encodedCall.length / 2 - 1;
+
+  try {
+    console.log(`  [${label}] Trying sudo...`);
+    const sudoTx = api.tx.sudo.sudo(batch);
+    await submitAndWait(sudoTx, signer, api, "sudo.sudo");
+    console.log(`  [${label}] Done via sudo`);
+    return;
+  } catch (sudoErr: any) {
+    console.log(`  [${label}] Sudo not available (${sudoErr.message}), using governance...`);
+  }
+
+  await submitAndWait(
+    api.tx.preimage.notePreimage(encodedCall), signer, api, "notePreimage"
+  );
+  await submitAndWait(
+    api.tx.referenda.submit(
+      { system: "Root" },
+      { Lookup: { hash: encodedHash, len: encodedLen } },
+      { After: 1 }
+    ),
+    signer, api, "submitReferendum"
+  );
+
+  const refIndex = parseInt((await api.query.referenda.referendumCount()).toString()) - 1;
+  console.log(`    Referendum index: ${refIndex}`);
+
+  await submitAndWait(
+    api.tx.referenda.placeDecisionDeposit(refIndex), signer, api, "placeDeposit"
+  );
+
+  const { data } = (await api.query.system.account(signer.address)) as any;
+  const voteAmount = (data.free.toBigInt() * 5n) / 10n;
+
+  await submitAndWait(
+    api.tx.convictionVoting.vote(refIndex, {
+      Standard: { balance: voteAmount, vote: { aye: true, conviction: "Locked1x" } },
+    }),
+    signer, api, "vote"
+  );
+
+  // Try to advance blocks on dev nodes
+  try {
+    for (let i = 0; i < 5; i++) {
+      await (api.rpc as any).engine.createBlock(true, true);
+    }
+  } catch {
+    try {
+      await (api.rpc as any)("dev_newBlock", { count: 10 });
+    } catch {
+      // Not a dev node — fall through to polling
+    }
+  }
+
+  // Poll referendum status until enacted or timeout
+  console.log(`  [${label}] Waiting for referendum ${refIndex} to enact...`);
+  const pollStart = Date.now();
+  const ENACTMENT_TIMEOUT_MS = 180_000; // 3 minutes
+  while (Date.now() - pollStart < ENACTMENT_TIMEOUT_MS) {
+    const info = (await api.query.referenda.referendumInfoFor(refIndex)).toHuman() as any;
+    if (info?.Approved) {
+      process.stdout.write(".");
+      await new Promise((r) => setTimeout(r, 6_000));
+      continue;
+    }
+    if (info?.Ongoing) {
+      process.stdout.write(".");
+      await new Promise((r) => setTimeout(r, 6_000));
+      continue;
+    }
+    // Confirmed, Rejected, TimedOut, Cancelled, Killed — all terminal
+    console.log(`\n  [${label}] Referendum ${refIndex} final status: ${JSON.stringify(info)}`);
+    return;
+  }
+  console.log(`\n  [${label}] Referendum ${refIndex} still pending after ${ENACTMENT_TIMEOUT_MS / 1000}s — continuing anyway`);
+}
+
 async function fundAliceViaGovernance(evmAddress: string): Promise<void> {
   const wsUrl = WS_URLS[NETWORK];
   if (!wsUrl) throw new Error(`No WS URL for network: ${NETWORK}`);
@@ -340,17 +445,10 @@ async function fundAliceViaGovernance(evmAddress: string): Promise<void> {
   const aliceSr25519 = keyring.addFromUri("//Alice");
   const truncated = evmTruncatedAccount(evmAddress);
 
+  // Mint tokens to Alice's EVM-mapped substrate account
   const mints: { symbol: string; assetId: number; amount: string }[] = [
-    {
-      symbol: "DOT",
-      assetId: TOKENS.DOT.id,
-      amount: ethers.utils.parseUnits("100", TOKENS.DOT.decimals).toString(),
-    },
-    {
-      symbol: "USDC",
-      assetId: TOKENS.USDC.id,
-      amount: ethers.utils.parseUnits("1000", TOKENS.USDC.decimals).toString(),
-    },
+    { symbol: "DOT",  assetId: TOKENS.DOT.id, amount: ethers.utils.parseUnits("1000", TOKENS.DOT.decimals).toString() },
+    { symbol: "USDC", assetId: TOKENS.USDC.id, amount: ethers.utils.parseUnits("10000", TOKENS.USDC.decimals).toString() },
   ];
 
   const calls: any[] = [];
@@ -360,63 +458,61 @@ async function fundAliceViaGovernance(evmAddress: string): Promise<void> {
   }
 
   const batch = api.tx.utility.batchAll(calls);
-  const encodedCall = batch.method.toHex();
-  const encodedHash = blake2AsHex(encodedCall);
-  const encodedLen = encodedCall.length / 2 - 1;
+  await executeViaSudoOrGovernance(api, aliceSr25519, batch, "Fund Alice");
 
-  try {
-    console.log("  Trying sudo...");
-    const sudoTx = api.tx.sudo.sudo(batch);
-    await submitAndWait(sudoTx, aliceSr25519, api, "sudo.sudo");
-    console.log("  Funded via sudo");
-  } catch (sudoErr: any) {
-    console.log(`  Sudo not available (${sudoErr.message}), using governance...`);
+  await api.disconnect();
+}
 
-    await submitAndWait(
-      api.tx.preimage.notePreimage(encodedCall), aliceSr25519, api, "notePreimage"
-    );
-    await submitAndWait(
-      api.tx.referenda.submit(
-        { system: "Root" },
-        { Lookup: { hash: encodedHash, len: encodedLen } },
-        { After: 1 }
-      ),
-      aliceSr25519, api, "submitReferendum"
-    );
+async function seedDexLiquidity(): Promise<void> {
+  const wsUrl = WS_URLS[NETWORK];
+  if (!wsUrl) throw new Error(`No WS URL for network: ${NETWORK}`);
 
-    const refIndex = parseInt((await api.query.referenda.referendumCount()).toString()) - 1;
-    console.log(`    Referendum index: ${refIndex}`);
+  console.log(`  Connecting to ${wsUrl}...`);
+  const wsProvider = new WsProvider(wsUrl);
+  const api = await ApiPromise.create({ provider: wsProvider, noInitWarn: true });
 
-    await submitAndWait(
-      api.tx.referenda.placeDecisionDeposit(refIndex), aliceSr25519, api, "placeDeposit"
-    );
+  const keyring = new Keyring({ type: "sr25519" });
+  const aliceSr25519 = keyring.addFromUri("//Alice");
 
-    const { data } = (await api.query.system.account(aliceSr25519.address)) as any;
-    const voteAmount = (data.free.toBigInt() * 5n) / 10n;
+  // Mint enough for BOTH pools — HDX is used in both so we mint 2x
+  const hdxPerPool = "1000000000000000";  // 1M HDX (12 decimals) per pool
+  const totalHdx   = "2000000000000000";  // 2M HDX total
+  const dotAmount  = ethers.utils.parseUnits("100", TOKENS.DOT.decimals).toString();
+  const usdcAmount = ethers.utils.parseUnits("1000", TOKENS.USDC.decimals).toString();
+  const MAX_LIMIT  = "340282366920938463463374607431768211455"; // u128::MAX
 
-    await submitAndWait(
-      api.tx.convictionVoting.vote(refIndex, {
-        Standard: { balance: voteAmount, vote: { aye: true, conviction: "Locked1x" } },
-      }),
-      aliceSr25519, api, "vote"
-    );
+  console.log("  Minting tokens for XYK pool seeding...");
+  const mintCalls = [
+    api.tx.currencies.updateBalance(aliceSr25519.address, HDX_ID, totalHdx),
+    api.tx.currencies.updateBalance(aliceSr25519.address, TOKENS.DOT.id, dotAmount),
+    api.tx.currencies.updateBalance(aliceSr25519.address, TOKENS.USDC.id, usdcAmount),
+  ];
+  const mintBatch = api.tx.utility.batchAll(mintCalls);
+  await executeViaSudoOrGovernance(api, aliceSr25519, mintBatch, "Mint for XYK");
 
-    console.log("  Advancing blocks...");
+  // Seed XYK pools — try addLiquidity with MAX_LIMIT, fallback to createPool
+  const pools: { a: number; b: number; amountA: string; amountB: string; label: string }[] = [
+    { a: TOKENS.DOT.id, b: HDX_ID,         amountA: dotAmount,   amountB: hdxPerPool, label: "DOT/HDX" },
+    { a: HDX_ID,         b: TOKENS.USDC.id, amountA: hdxPerPool,  amountB: usdcAmount, label: "HDX/USDC" },
+  ];
+
+  for (const pp of pools) {
+    console.log(`  Seeding ${pp.label} XYK pool...`);
     try {
-      for (let i = 0; i < 5; i++) {
-        await (api.rpc as any).engine.createBlock(true, true);
-      }
-    } catch {
+      // addLiquidity with MAX_LIMIT so any pool ratio is accepted
+      const addLiqTx = api.tx.xyk.addLiquidity(pp.a, pp.b, pp.amountA, MAX_LIMIT);
+      await submitAndWait(addLiqTx, aliceSr25519, api, `addLiquidity ${pp.label}`);
+      console.log(`  ${pp.label}: liquidity added`);
+    } catch (addErr: any) {
+      console.log(`  ${pp.label} addLiquidity failed (${addErr.message}), trying createPool...`);
       try {
-        await (api.rpc as any)("dev_newBlock", { count: 10 });
-      } catch {
-        console.log("  Cannot advance blocks automatically. Waiting 30s...");
-        await new Promise((r) => setTimeout(r, 30_000));
+        const createTx = api.tx.xyk.createPool(pp.a, pp.amountA, pp.b, pp.amountB);
+        await submitAndWait(createTx, aliceSr25519, api, `createPool ${pp.label}`);
+        console.log(`  ${pp.label}: pool created`);
+      } catch (createErr: any) {
+        console.log(`  ${pp.label}: could not seed (${createErr.message})`);
       }
     }
-
-    const info = await api.query.referenda.referendumInfoFor(refIndex);
-    console.log(`  Referendum status: ${JSON.stringify(info.toHuman())}`);
   }
 
   await api.disconnect();
@@ -525,8 +621,8 @@ async function main() {
   const usdcToken = new ethers.Contract(TOKENS.USDC.address, ERC20_ABI, alice);
   const dotBalance = await dotToken.balanceOf(alice.address);
   const usdcBalance = await usdcToken.balanceOf(alice.address);
-  const supplyDotAmount = ethers.utils.parseUnits("10", TOKENS.DOT.decimals);
-  const supplyUsdcAmount = ethers.utils.parseUnits("100", TOKENS.USDC.decimals);
+  const supplyDotAmount = ethers.utils.parseUnits("100", TOKENS.DOT.decimals);
+  const supplyUsdcAmount = ethers.utils.parseUnits("1000", TOKENS.USDC.decimals);
 
   if (dotBalance.lt(supplyDotAmount) || usdcBalance.lt(supplyUsdcAmount)) {
     console.log("\n[Step 1.5] Funding Alice via substrate governance...");
@@ -595,73 +691,100 @@ async function main() {
   }
 
   // ───────────────────────────────────────────
-  // Step 3.5: Pre-flight — probe XYK route with tiny amount
+  // Step 3.5: Seed DEX liquidity if needed
   // ───────────────────────────────────────────
-  console.log("\n[Step 3.5] Pre-flight: probe DOT→USDC XYK route");
-  let preflightOk = false;
-  {
-    // Try progressively smaller amounts until one works
-    const testAmounts = ["0.01", "0.001", "0.0001"];
+  console.log("\n[Step 3.5] Seeding DEX pool liquidity...");
+  await seedDexLiquidity();
+
+  // ───────────────────────────────────────────
+  // Step 3.6: Pre-flight — find a working route (Omnipool, XYK, …)
+  // ───────────────────────────────────────────
+  console.log("\n[Step 3.6] Pre-flight: probing DOT→USDC routes");
+
+  let activeRoute: RouteStrategy | null = null;
+  const testAmounts = ["0.01", "0.001", "0.0001"];
+
+  for (const strategy of ROUTE_STRATEGIES) {
+    console.log(`  Trying ${strategy.name}...`);
+    let found = false;
     for (const amtStr of testAmounts) {
       const testAmt = ethers.utils.parseUnits(amtStr, TOKENS.DOT.decimals);
       const data = buildSellDispatchData(
         TOKENS.DOT.id, TOKENS.USDC.id,
         testAmt.toBigInt(), 1n,
-        DOT_TO_USDC_ROUTE
+        strategy.dotToUsdc
       );
       const ok = await rawEthCall(
         alice.address, DISPATCH_PRECOMPILE, data,
-        `DOT→USDC (${amtStr} DOT)`
+        `${strategy.name} DOT→USDC (${amtStr} DOT)`
       );
       if (ok) {
-        preflightOk = true;
-        console.log(`  XYK route works at ${amtStr} DOT`);
+        console.log(`  ${strategy.name} route works at ${amtStr} DOT`);
+        found = true;
         break;
       }
     }
+    if (found) {
+      activeRoute = strategy;
+      break;
+    }
+    console.log(`  ${strategy.name}: no liquidity, trying next...`);
+  }
 
-    if (preflightOk) {
-      // Test full Augustus.sell with smallest working amount
-      const smallAmt = ethers.utils.parseUnits("0.001", TOKENS.DOT.decimals);
-      const dispatchData = buildSellDispatchData(
-        TOKENS.DOT.id, TOKENS.USDC.id,
-        smallAmt.toBigInt(), 1n,
-        DOT_TO_USDC_ROUTE
-      );
-      const aug = new ethers.Contract(hydraAugustus.address, [
-        "function sell(address,address,uint256,uint256,bytes) returns (uint256)",
-      ], alice);
-      await (await dotToken.approve(hydraAugustus.address, smallAmt, { gasLimit: 15_000_000 })).wait();
-      try {
+  if (activeRoute) {
+    // Validate full Augustus.sell through the working route
+    const smallAmt = ethers.utils.parseUnits("0.001", TOKENS.DOT.decimals);
+    const dispatchData = buildSellDispatchData(
+      TOKENS.DOT.id, TOKENS.USDC.id,
+      smallAmt.toBigInt(), 1n,
+      activeRoute.dotToUsdc
+    );
+    const aug = new ethers.Contract(hydraAugustus.address, [
+      "function sell(address,address,uint256,uint256,bytes) returns (uint256)",
+    ], alice);
+    await (await dotToken.approve(hydraAugustus.address, smallAmt, { gasLimit: 15_000_000 })).wait();
+    try {
+      // Check Alice has enough DOT for the test
+      const dotBal = await dotToken.balanceOf(alice.address);
+      if (dotBal.lt(smallAmt)) {
+        console.log(`  Alice DOT balance too low (${fmt(dotBal, TOKENS.DOT.decimals, "DOT")}), skipping Augustus.sell test`);
+      } else {
         const tx = await aug.sell(
           TOKENS.DOT.address, TOKENS.USDC.address,
           smallAmt, 1, dispatchData,
           { gasLimit: 15_000_000 }
         );
         const receipt = await tx.wait();
-        console.log(`  Augustus.sell: OK — gas ${receipt.gasUsed.toString()}`);
-      } catch (e: any) {
-        const reason = e.reason || e.error?.reason || e.error?.data || e.message;
-        console.error(`  Augustus.sell: FAILED — ${reason}`);
-        preflightOk = false;
+        console.log(`  Augustus.sell via ${activeRoute.name}: OK (gas ${receipt.gasUsed.toString()})`);
       }
-    }
-
-    if (!preflightOk) {
-      console.error("  XYK pools have insufficient liquidity for DOT→USDC on this testnet.");
-      console.error("  The contract is pool-agnostic — it works with any pool type given sufficient liquidity.");
-      console.error("  Aborting swap steps.");
+    } catch (e: any) {
+      // Extract the best error info available
+      let reason = e.reason || "unknown";
+      if (e.error?.data && e.error.data !== "0x") reason = e.error.data;
+      else if (e.error?.message) reason = e.error.message;
+      else if (e.message) reason = e.message;
+      console.error(`  Augustus.sell via ${activeRoute.name}: FAILED — ${reason}`);
+      console.error(`  Continuing anyway — dispatch route works, Augustus may need more EVM token balance`);
     }
   }
 
+  if (!activeRoute) {
+    throw new Error(
+      "No working DOT→USDC route found (tried Omnipool, XYK). " +
+      "Check that at least one pool type has liquidity on this testnet."
+    );
+  }
+
+  console.log(`  Using ${activeRoute.name} route for all swap steps`);
+
   // ───────────────────────────────────────────
-  // Step 4: Collateral swap — DOT → USDC via XYK
+  // Step 4: Collateral swap — DOT → USDC
   // ───────────────────────────────────────────
-  if (preflightOk) {
-    console.log("\n[Step 4] Collateral swap: DOT → USDC via XYK (no flash loan)");
+  {
+    console.log(`\n[Step 4] Collateral swap: DOT → USDC via ${activeRoute.name} (no flash loan)`);
 
     const dotCollateral = await dotATokenContract.balanceOf(alice.address);
-    // Swap a small fraction to stay within XYK pool ratio limits
+    // Swap a small fraction to stay within pool ratio limits
     const swapCollateralAmount = dotCollateral.div(100); // 1% of collateral
 
     const ORACLE_ABI = ["function getAssetPrice(address asset) view returns (uint256)"];
@@ -679,7 +802,7 @@ async function main() {
     const fromPriceScaled = dotPrice.mul(BigNumber.from(10).pow(TOKENS.USDC.decimals));
     const toPriceScaled = usdcPrice.mul(BigNumber.from(10).pow(TOKENS.DOT.decimals));
     const expectedBeforeSlippage = swapCollateralAmount.mul(fromPriceScaled).div(toPriceScaled);
-    const minUsdcOut = expectedBeforeSlippage.mul(5000).div(10000); // 50% slippage for XYK
+    const minUsdcOut = expectedBeforeSlippage.mul(5000).div(10000); // 50% slippage tolerance
     console.log(`  Swapping ${fmt(swapCollateralAmount, TOKENS.DOT.decimals, "DOT")} collateral`);
     console.log(`  Expected: ${fmt(expectedBeforeSlippage, TOKENS.USDC.decimals, "USDC")}`);
     console.log(`  Min out (50%): ${fmt(minUsdcOut, TOKENS.USDC.decimals, "USDC")}`);
@@ -693,7 +816,7 @@ async function main() {
       TOKENS.DOT.address, TOKENS.USDC.address,
       swapCollateralAmount.toBigInt(), minUsdcOut.toBigInt(),
       TOKENS.DOT.id, TOKENS.USDC.id,
-      DOT_TO_USDC_ROUTE
+      activeRoute.dotToUsdc
     );
 
     const liqAdapter = new ethers.Contract(
@@ -727,10 +850,10 @@ async function main() {
   }
 
   // ───────────────────────────────────────────
-  // Step 5: Debt swap — USDC → DOT via XYK (requires flash loan)
+  // Step 5: Debt swap — USDC → DOT (requires flash loan)
   // ───────────────────────────────────────────
-  if (preflightOk && canDebtSwap) {
-    console.log("\n[Step 5] Debt swap: USDC → DOT via XYK (flash loan)");
+  if (canDebtSwap) {
+    console.log(`\n[Step 5] Debt swap: USDC → DOT via ${activeRoute.name} (flash loan)`);
 
     const currentUsdcDebt = await new ethers.Contract(usdcVToken, ERC20_ABI, alice).balanceOf(alice.address);
     const currentDotDebt = await new ethers.Contract(dotVToken, ERC20_ABI, alice).balanceOf(alice.address);
@@ -769,8 +892,6 @@ async function main() {
       ).wait();
       console.log("  Credit delegation approved");
 
-      // Buy USDC (to repay old debt) using DOT (new debt)
-      // Route: DOT→HDX→USDC via XYK
       const buyParaswapData = buildBuyParaswapData(
         hydraAugustus.address,
         TOKENS.DOT.address,  // tokenIn (new debt)
@@ -778,7 +899,7 @@ async function main() {
         maxNewDebt.toBigInt(),
         currentUsdcDebt.toBigInt(),
         TOKENS.DOT.id, TOKENS.USDC.id,
-        DOT_TO_USDC_ROUTE
+        activeRoute.dotToUsdc
       );
 
       const debtAdapter = new ethers.Contract(
@@ -812,8 +933,6 @@ async function main() {
       await debtSwapTx.wait();
       console.log("  Debt swap executed");
     }
-  } else if (!preflightOk) {
-    console.log("\n[Step 5] SKIPPED — XYK route failed pre-flight");
   } else {
     console.log("\n[Step 5] SKIPPED — debt swap requires flash loans to be enabled");
   }
@@ -847,7 +966,7 @@ async function main() {
     passed = false;
   }
 
-  if (preflightOk && canDebtSwap) {
+  if (canDebtSwap) {
     if (!finalUsdcDebt.isZero()) {
       console.error("  FAIL: USDC debt should be 0 after debt swap");
       passed = false;
@@ -861,7 +980,7 @@ async function main() {
       console.log("  PASS: DOT debt > 0");
     }
   } else {
-    console.log("  SKIP: Debt swap assertions (pre-flight or flash loans not ready)");
+    console.log("  SKIP: Debt swap assertions (flash loans not enabled)");
   }
 
   // Check no tokens stuck in contracts
