@@ -129,8 +129,26 @@ abstract contract BaseParaSwapAdapter is Ownable, IBaseParaSwapAdapter {
   function _conditionalRenewAllowance(address asset, uint256 minAmount) internal {
     uint256 allowance = IERC20(asset).allowance(address(this), address(POOL));
     if (allowance < minAmount) {
-      IERC20(asset).safeApprove(address(POOL), 0);
-      IERC20(asset).safeApprove(address(POOL), type(uint256).max);
+      _safeApproveToken(asset, address(POOL), 0);
+      _safeApproveToken(asset, address(POOL), type(uint128).max);
     }
+  }
+
+  /**
+   * @dev Approve a token to a spender using a low-level call, bypassing the isContract check
+   * in OpenZeppelin's SafeERC20/Address libraries. This is necessary for Hydration substrate
+   * precompile tokens which have no EVM bytecode but are callable.
+   * @param token The address of the token
+   * @param spender The address of the spender
+   * @param amount The amount to approve
+   */
+  function _safeApproveToken(address token, address spender, uint256 amount) internal {
+    (bool success, bytes memory returndata) = token.call(
+      abi.encodeWithSelector(IERC20.approve.selector, spender, amount)
+    );
+    require(
+      success && (returndata.length == 0 || abi.decode(returndata, (bool))),
+      'APPROVE_FAILED'
+    );
   }
 }

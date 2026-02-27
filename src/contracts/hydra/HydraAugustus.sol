@@ -2,12 +2,19 @@
 pragma solidity ^0.8.10;
 
 import {IERC20} from '@aave/core-v3/contracts/dependencies/openzeppelin/contracts/IERC20.sol';
-import {SafeERC20} from '@aave/core-v3/contracts/dependencies/openzeppelin/contracts/SafeERC20.sol';
 import {IParaSwapAugustus} from '../dependencies/paraswap/IParaSwapAugustus.sol';
 
+/**
+ * @title HydraAugustus
+ * @notice ParaSwap Augustus-compatible DEX aggregator for Hydration substrate runtime.
+ * @dev Routes sell/buy swaps through the substrate Dispatch precompile (0x0401) by
+ *      forwarding SCALE-encoded `route_executor.sell` / `route_executor.buy` calls.
+ *      Amounts in the SCALE payload are patched at runtime via `_patchAmounts()` so the
+ *      on-chain call reflects the adapter's actual balance rather than the frontend estimate.
+ *      Token interactions use low-level `call` instead of SafeERC20 because substrate
+ *      precompile tokens have no EVM bytecode and would fail the `isContract` check.
+ */
 contract HydraAugustus is IParaSwapAugustus {
-    using SafeERC20 for IERC20;
-
     address public immutable DISPATCH;
 
     uint256 internal constant SCALE_FIRST_AMOUNT_OFFSET = 10;
@@ -38,6 +45,16 @@ contract HydraAugustus is IParaSwapAugustus {
         return address(this);
     }
 
+    /**
+     * @notice Execute an exact-input swap via the substrate route executor.
+     * @param tokenIn  The token to sell.
+     * @param tokenOut The token to receive.
+     * @param amountIn The exact amount of `tokenIn` to sell (must fit u128).
+     * @param minAmountOut The minimum acceptable amount of `tokenOut` (must fit u128).
+     * @param dispatchData SCALE-encoded `route_executor.sell` call; the two u128 amount
+     *        fields at byte offsets [10..26) and [26..42) are overwritten by `_patchAmounts`.
+     * @return amountOut The amount of `tokenOut` received.
+     */
     function sell(
         address tokenIn,
         address tokenOut,
@@ -50,23 +67,33 @@ contract HydraAugustus is IParaSwapAugustus {
         require(minAmountOut <= MAX_UINT128, 'AMOUNT_OVERFLOW_UINT128');
         require(dispatchData.length >= MIN_DISPATCH_DATA_LENGTH, 'DISPATCH_DATA_TOO_SHORT');
 
-        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
+        _safeTransferFrom(tokenIn, msg.sender, address(this), amountIn);
 
         uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
 
-        IERC20(tokenIn).safeApprove(DISPATCH, 0);
-        IERC20(tokenIn).safeApprove(DISPATCH, amountIn);
+        _safeApprove(tokenIn, DISPATCH, 0);
+        _safeApprove(tokenIn, DISPATCH, amountIn);
 
         _dispatch(_patchAmounts(dispatchData, amountIn, minAmountOut));
 
         amountOut = IERC20(tokenOut).balanceOf(address(this)) - balanceBefore;
         require(amountOut >= minAmountOut, 'INSUFFICIENT_OUTPUT');
 
-        IERC20(tokenOut).safeTransfer(msg.sender, amountOut);
+        _safeTransfer(tokenOut, msg.sender, amountOut);
 
         emit Sold(tokenIn, tokenOut, amountIn, amountOut);
     }
 
+    /**
+     * @notice Execute an exact-output swap via the substrate route executor.
+     * @param tokenIn  The token to spend.
+     * @param tokenOut The token to receive.
+     * @param maxAmountIn The maximum amount of `tokenIn` willing to spend (must fit u128).
+     * @param amountOut The exact amount of `tokenOut` desired (must fit u128).
+     * @param dispatchData SCALE-encoded `route_executor.buy` call; the two u128 amount
+     *        fields at byte offsets [10..26) and [26..42) are overwritten by `_patchAmounts`.
+     * @return amountIn The actual amount of `tokenIn` consumed.
+     */
     function buy(
         address tokenIn,
         address tokenOut,
@@ -79,13 +106,13 @@ contract HydraAugustus is IParaSwapAugustus {
         require(amountOut <= MAX_UINT128, 'AMOUNT_OVERFLOW_UINT128');
         require(dispatchData.length >= MIN_DISPATCH_DATA_LENGTH, 'DISPATCH_DATA_TOO_SHORT');
 
-        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), maxAmountIn);
+        _safeTransferFrom(tokenIn, msg.sender, address(this), maxAmountIn);
 
         uint256 balanceInBefore = IERC20(tokenIn).balanceOf(address(this));
         uint256 balanceOutBefore = IERC20(tokenOut).balanceOf(address(this));
 
-        IERC20(tokenIn).safeApprove(DISPATCH, 0);
-        IERC20(tokenIn).safeApprove(DISPATCH, maxAmountIn);
+        _safeApprove(tokenIn, DISPATCH, 0);
+        _safeApprove(tokenIn, DISPATCH, maxAmountIn);
 
         _dispatch(_patchAmounts(dispatchData, amountOut, maxAmountIn));
 
@@ -94,19 +121,34 @@ contract HydraAugustus is IParaSwapAugustus {
 
         require(received >= amountOut, 'INSUFFICIENT_OUTPUT');
 
-        IERC20(tokenOut).safeTransfer(msg.sender, received);
+        _safeTransfer(tokenOut, msg.sender, received);
         if (amountIn < maxAmountIn) {
-            IERC20(tokenIn).safeTransfer(msg.sender, maxAmountIn - amountIn);
+            _safeTransfer(tokenIn, msg.sender, maxAmountIn - amountIn);
         }
 
         emit Bought(tokenIn, tokenOut, amountIn, received);
     }
 
-    // The adapter may overwrite ABI-level amounts at runtime (e.g. "swap all balance" reads
-    // the actual debt/collateral balance on-chain). But the SCALE-encoded dispatchData still
-    // holds the frontend's original estimate. This function patches the two u128 amount fields
-    // in the SCALE bytes (little-endian at offsets [10..26) and [26..42)) so the Dispatch
-    // precompile receives the correct values.
+    /**
+     * @dev Patch the two u128 amount fields inside SCALE-encoded dispatch data.
+     *
+     * The adapter may overwrite ABI-level amounts at runtime (e.g. "swap all balance" reads
+     * the actual debt/collateral balance on-chain). But the SCALE-encoded `dispatchData` still
+     * holds the frontend's original estimate. This function overwrites the two little-endian
+     * u128 fields so the Dispatch precompile receives the correct values.
+     *
+     * SCALE byte layout (route_executor.sell / route_executor.buy):
+     *   [0..2)   pallet + call index
+     *   [2..10)  asset_in / asset_out identifiers
+     *   [10..26) first u128  — amount_in (sell) or amount_out (buy)
+     *   [26..42) second u128 — min_amount_out (sell) or max_amount_in (buy)
+     *   [42..)   route data
+     *
+     * @param dispatchData The original SCALE-encoded call (minimum 42 bytes).
+     * @param firstAmount  Value to write at bytes [10..26) in little-endian u128.
+     * @param secondAmount Value to write at bytes [26..42) in little-endian u128.
+     * @return data The patched SCALE bytes, ready for `_dispatch()`.
+     */
     function _patchAmounts(
         bytes calldata dispatchData,
         uint256 firstAmount,
@@ -155,6 +197,34 @@ contract HydraAugustus is IParaSwapAugustus {
         }
     }
 
+    /// @dev Low-level approve bypassing isContract check for substrate precompile tokens
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool success, bytes memory returndata) = token.call(
+            abi.encodeWithSelector(IERC20.approve.selector, spender, amount)
+        );
+        require(success && (returndata.length == 0 || abi.decode(returndata, (bool))), 'APPROVE_FAILED');
+    }
+
+    /// @dev Low-level transfer bypassing isContract check for substrate precompile tokens
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool success, bytes memory returndata) = token.call(
+            abi.encodeWithSelector(IERC20.transfer.selector, to, amount)
+        );
+        require(success && (returndata.length == 0 || abi.decode(returndata, (bool))), 'TRANSFER_FAILED');
+    }
+
+    /// @dev Low-level transferFrom bypassing isContract check for substrate precompile tokens
+    function _safeTransferFrom(address token, address from, address to, uint256 amount) internal {
+        (bool success, bytes memory returndata) = token.call(
+            abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount)
+        );
+        require(success && (returndata.length == 0 || abi.decode(returndata, (bool))), 'TRANSFER_FROM_FAILED');
+    }
+
+    /**
+     * @dev Forward a SCALE-encoded extrinsic to the substrate Dispatch precompile.
+     * @param data The fully encoded call bytes (pallet index + call data).
+     */
     function _dispatch(bytes memory data) internal {
         (bool success, bytes memory returnData) = DISPATCH.call(data);
         if (!success) {

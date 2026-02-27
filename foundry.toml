@@ -7,6 +7,8 @@ libs = ['lib']
 remappings = [
 ]
 ffi = true
+optimizer = true
+optimizer_runs = 200
 
 [rpc_endpoints]
 mainnet = "${RPC_MAINNET}"

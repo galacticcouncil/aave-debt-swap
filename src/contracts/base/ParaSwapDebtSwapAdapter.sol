@@ -37,10 +37,19 @@ abstract contract ParaSwapDebtSwapAdapter is
     address owner
   ) BaseParaSwapBuyAdapter(addressesProvider, pool, augustusRegistry) {
     transferOwnership(owner);
-    // set initial approval for all reserves
+  }
+
+  /**
+   * @notice Pre-approve all current pool reserves to the Pool contract.
+   * @dev Must be called by the owner after deployment. Required because Hydration substrate
+   *      precompile tokens need explicit approval before the adapter can supply/repay on
+   *      behalf of users. Uses `type(uint128).max` instead of `type(uint256).max` to stay
+   *      within substrate's u128 balance range.
+   */
+  function approvePoolReserves() external onlyOwner {
     address[] memory reserves = POOL.getReservesList();
     for (uint256 i = 0; i < reserves.length; i++) {
-      IERC20WithPermit(reserves[i]).safeApprove(address(POOL), type(uint256).max);
+      _safeApproveToken(reserves[i], address(POOL), type(uint128).max);
     }
   }
 

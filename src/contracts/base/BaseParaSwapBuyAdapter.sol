@@ -82,8 +82,8 @@ abstract contract BaseParaSwapBuyAdapter is BaseParaSwapAdapter {
     uint256 balanceBeforeAssetTo = assetToSwapTo.balanceOf(address(this));
 
     address tokenTransferProxy = augustus.getTokenTransferProxy();
-    assetToSwapFrom.safeApprove(tokenTransferProxy, 0);
-    assetToSwapFrom.safeApprove(tokenTransferProxy, maxAmountToSwap);
+    _safeApproveToken(address(assetToSwapFrom), tokenTransferProxy, 0);
+    _safeApproveToken(address(assetToSwapFrom), tokenTransferProxy, maxAmountToSwap);
 
     if (toAmountOffset != 0) {
       // Ensure 256 bit (32 bytes) toAmountOffset value is within bounds of the
