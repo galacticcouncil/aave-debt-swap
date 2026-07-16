@@ -72,6 +72,6 @@ abstract contract ParaSwapWithdrawSwapAdapter is
     );
 
     // transfer new asset to the user
-    IERC20(withdrawSwapParams.newAsset).safeTransfer(withdrawSwapParams.user, amountReceived);
+    _safeTransferToken(withdrawSwapParams.newAsset, withdrawSwapParams.user, amountReceived);
   }
 }

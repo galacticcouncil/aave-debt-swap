@@ -266,6 +266,28 @@ struct PermitInput {
 
 For usage examples please check the [tests](./tests/).
 
+## Hydration Integration
+
+This fork extends the adapter stack to support [Hydration](https://hydration.net/), a substrate-based chain with an EVM runtime. Two new contracts replace ParaSwap on Hydration:
+
+- **[HydraAugustus](./src/contracts/hydra/HydraAugustus.sol)** — Augustus-compatible DEX aggregator that routes swaps through the substrate Dispatch precompile (`0x0401`) to the Hydration route executor. Supports sell (exact-input) and buy (exact-output) operations across Omnipool, XYK, Stableswap, and LBP pools.
+
+- **[HydraAugustusRegistry](./src/contracts/hydra/HydraAugustusRegistry.sol)** — Minimal owner-managed registry implementing `IParaSwapAugustusRegistry` for tracking valid HydraAugustus instances.
+
+Key compatibility changes in the base adapters:
+- Token interactions use low-level `call` instead of `SafeERC20` to support substrate precompile tokens (no EVM bytecode).
+- Approval amounts are capped at `type(uint128).max` for substrate u128 compatibility.
+- `approvePoolReserves()` must be called on each adapter after deployment.
+
+See [docs/hydration-integration.md](./docs/hydration-integration.md) for full architecture and deployment details.
+
+## Scripts
+
+| Script | Description |
+|--------|-------------|
+| `scripts/governance-flash-loans.ts` | Enable flash loans on Hydration Aave reserves via substrate governance. See [docs/governance-flash-loans.md](./docs/governance-flash-loans.md). |
+| `scripts/test-hydra-e2e.ts` | End-to-end test for debt swap on Hydration testnet. Requires `PRIVATE_KEY` env var. |
+
 ## Security
 
 Security considerations around the ParaSwap adapter contracts:
@@ -297,6 +319,10 @@ Security considerations around the ParaSwap adapter contracts:
 
   - A SELL action of X means the adapter contract will spend X exactly for the swap. In case of receiving more than X, is considered dust and automatically donated to the contract.
   - A BUY action of Y means the adapter contract will receive Y exactly as a result of the swap. In case of receiving more than Y, is considered dust and automatically donated to the contract.
+
+- On Hydration, all amounts are capped at `type(uint128).max` to fit substrate's u128 balance type. Amounts exceeding this limit will revert.
+
+- On Hydration, `approvePoolReserves()` is a required post-deployment step on each adapter. Without it, the adapters cannot supply or repay tokens to the Pool. If new reserves are added to the Pool after deployment, `approvePoolReserves()` must be called again.
 
 - Contracts support Aave V2 and V3. There are contracts specifically designed for each version, as well as for working with GHO.
 

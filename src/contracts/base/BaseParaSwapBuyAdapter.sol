@@ -62,8 +62,8 @@ abstract contract BaseParaSwapBuyAdapter is BaseParaSwapAdapter {
     require(AUGUSTUS_REGISTRY.isValidAugustus(address(augustus)), 'INVALID_AUGUSTUS');
 
     {
-      uint256 fromAssetDecimals = _getDecimals(assetToSwapFrom);
-      uint256 toAssetDecimals = _getDecimals(assetToSwapTo);
+      uint256 fromAssetDecimals = _safeTokenDecimals(address(assetToSwapFrom));
+      uint256 toAssetDecimals = _safeTokenDecimals(address(assetToSwapTo));
 
       uint256 fromAssetPrice = _getPrice(address(assetToSwapFrom));
       uint256 toAssetPrice = _getPrice(address(assetToSwapTo));
@@ -76,14 +76,14 @@ abstract contract BaseParaSwapBuyAdapter is BaseParaSwapAdapter {
       require(maxAmountToSwap <= expectedMaxAmountToSwap, 'maxAmountToSwap exceeds max slippage');
     }
 
-    uint256 balanceBeforeAssetFrom = assetToSwapFrom.balanceOf(address(this));
+    uint256 balanceBeforeAssetFrom = _safeBalanceOf(address(assetToSwapFrom), address(this));
     require(balanceBeforeAssetFrom >= maxAmountToSwap, 'INSUFFICIENT_BALANCE_BEFORE_SWAP');
 
-    uint256 balanceBeforeAssetTo = assetToSwapTo.balanceOf(address(this));
+    uint256 balanceBeforeAssetTo = _safeBalanceOf(address(assetToSwapTo), address(this));
 
     address tokenTransferProxy = augustus.getTokenTransferProxy();
-    assetToSwapFrom.safeApprove(tokenTransferProxy, 0);
-    assetToSwapFrom.safeApprove(tokenTransferProxy, maxAmountToSwap);
+    _safeApproveToken(address(assetToSwapFrom), tokenTransferProxy, 0);
+    _safeApproveToken(address(assetToSwapFrom), tokenTransferProxy, maxAmountToSwap);
 
     if (toAmountOffset != 0) {
       // Ensure 256 bit (32 bytes) toAmountOffset value is within bounds of the
@@ -109,12 +109,12 @@ abstract contract BaseParaSwapBuyAdapter is BaseParaSwapAdapter {
     }
 
     // Amount provided should be less or equal than `maxAmountToSwap`
-    uint256 balanceAfterAssetFrom = assetToSwapFrom.balanceOf(address(this));
+    uint256 balanceAfterAssetFrom = _safeBalanceOf(address(assetToSwapFrom), address(this));
     amountSold = balanceBeforeAssetFrom - balanceAfterAssetFrom;
     require(amountSold <= maxAmountToSwap, 'WRONG_BALANCE_AFTER_SWAP');
 
     // Amount received should be equal (or even higher) than `amountToReceive`
-    uint256 amountReceived = assetToSwapTo.balanceOf(address(this)) - balanceBeforeAssetTo;
+    uint256 amountReceived = _safeBalanceOf(address(assetToSwapTo), address(this)) - balanceBeforeAssetTo;
     require(amountReceived >= amountToReceive, 'INSUFFICIENT_AMOUNT_RECEIVED');
 
     emit Bought(address(assetToSwapFrom), address(assetToSwapTo), amountSold, amountReceived);

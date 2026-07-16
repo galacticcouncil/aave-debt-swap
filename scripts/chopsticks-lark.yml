@@ -1,0 +1,16 @@
+# Chopsticks fork of Hydration lark testnet
+# Usage: npx @acala-network/chopsticks@latest --config=scripts/chopsticks-lark.yml
+# Then: HYDRA_NETWORK=chopsticks npx ts-node scripts/test-hydra-e2e.ts
+endpoint: wss://node.lark.hydration.cloud
+mock-signature-host: true
+db: ./db-lark.sqlite
+
+import-storage:
+  System:
+    Account:
+      # Alice substrate account — massive HDX so her governance vote exceeds
+      # the 36% support threshold and referenda pass in ~10 blocks.
+      - - - 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+        - providers: 1
+          data:
+            free: '90000000000000000000000000'
