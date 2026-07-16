@@ -10,6 +10,9 @@ dist/
 .idea
 .vscode
 
+# macOS (matches .DS_Store in any folder or subfolder)
+.DS_Store
+
 # well, looks strange to ignore package-lock, but we have only pretter and it's temproray
 package-lock.json
 node_modules

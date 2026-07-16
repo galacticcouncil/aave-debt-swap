@@ -3,19 +3,33 @@ pragma solidity ^0.8.10;
 
 import {IERC20} from '@aave/core-v3/contracts/dependencies/openzeppelin/contracts/IERC20.sol';
 import {IParaSwapAugustus} from '../dependencies/paraswap/IParaSwapAugustus.sol';
+import {HydraRouteEncoder} from './HydraRouteEncoder.sol';
 
 /**
  * @title HydraAugustus
  * @notice ParaSwap Augustus-compatible DEX aggregator for Hydration substrate runtime.
  * @dev Routes sell/buy swaps through the substrate Dispatch precompile (0x0401) by
- *      forwarding SCALE-encoded `route_executor.sell` / `route_executor.buy` calls.
- *      Amounts in the SCALE payload are patched at runtime via `_patchAmounts()` so the
- *      on-chain call reflects the adapter's actual balance rather than the frontend estimate.
- *      Token interactions use low-level `call` instead of SafeERC20 because substrate
- *      precompile tokens have no EVM bytecode and would fail the `isContract` check.
+ *      forwarding a SCALE-encoded `route_executor.sell` / `route_executor.buy` call. The
+ *      call is either built here from a governance-set `address → assetId` map with an
+ *      EMPTY route — so Hydration's router resolves the pools from its own on-chain
+ *      governance storage (`set_route`) — or supplied by the caller as `dispatchData` and
+ *      amount-patched via `_patchAmounts()`. Token interactions use low-level `call` instead
+ *      of SafeERC20 because substrate precompile tokens have no EVM bytecode and would fail
+ *      the `isContract` check.
  */
 contract HydraAugustus is IParaSwapAugustus {
     address public immutable DISPATCH;
+
+    /// @notice Governance owner permitted to configure asset ids and routes.
+    address public owner;
+
+    /// @notice EVM token address → Hydration substrate asset id (governance-set).
+    /// @dev Consumed by the empty-`dispatchData` path, which builds the `route_executor`
+    ///      call from asset ids. ERC-20s like HOLLAR (asset 222) don't encode their id
+    ///      in-address the way Omnipool-style tokens like PRIME (asset 43) do, so the map
+    ///      is required. A token must be registered (non-zero id) to swap via that path;
+    ///      the route itself lives on the router, not here.
+    mapping(address => uint32) public assetId;
 
     uint256 internal constant SCALE_FIRST_AMOUNT_OFFSET = 10;
     uint256 internal constant SCALE_SECOND_AMOUNT_OFFSET = 26;
@@ -36,9 +50,45 @@ contract HydraAugustus is IParaSwapAugustus {
         uint256 amountOut
     );
 
+    event AssetIdSet(address indexed token, uint32 indexed assetId);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, 'ONLY_OWNER');
+        _;
+    }
+
     constructor(address dispatch) {
         require(dispatch != address(0), 'ZERO_DISPATCH');
         DISPATCH = dispatch;
+        owner = msg.sender;
+        emit OwnershipTransferred(address(0), msg.sender);
+    }
+
+    // ── Governance configuration ──────────────────────────────────────────
+
+    /**
+     * @notice Map an EVM token address to its Hydration substrate asset id.
+     * @dev Consumed by the empty-`dispatchData` path in `sell`/`buy`. A token must be
+     *      registered here (non-zero id) to swap via that path, so HDX (asset 0) is not
+     *      reachable this way — pass explicit `dispatchData` for it. The route is resolved
+     *      by the on-chain router, not stored here.
+     * @param token The ERC-20 / precompile token address.
+     * @param id    The substrate asset id used inside the SCALE call.
+     */
+    function setAssetId(address token, uint32 id) external onlyOwner {
+        require(token != address(0), 'ZERO_ADDRESS');
+        assetId[token] = id;
+        emit AssetIdSet(token, id);
+    }
+
+    /**
+     * @notice Transfer governance ownership (e.g. deployer → Hydration governance).
+     */
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), 'ZERO_ADDRESS');
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
     }
 
     function getTokenTransferProxy() external view override returns (address) {
@@ -47,12 +97,18 @@ contract HydraAugustus is IParaSwapAugustus {
 
     /**
      * @notice Execute an exact-input swap via the substrate route executor.
+     * @dev Two modes:
+     *      - empty `dispatchData` → build `route_executor.sell(assetId[tokenIn],
+     *        assetId[tokenOut], amountIn, minAmountOut, [])` with an EMPTY route, so the
+     *        router uses its governance-set on-chain route (keeper path);
+     *      - non-empty `dispatchData` → treat it as a caller-supplied SCALE call and patch
+     *        the amounts at offsets [10..26)/[26..42) (frontend / debt-swap path).
      * @param tokenIn  The token to sell.
      * @param tokenOut The token to receive.
      * @param amountIn The exact amount of `tokenIn` to sell (must fit u128).
      * @param minAmountOut The minimum acceptable amount of `tokenOut` (must fit u128).
-     * @param dispatchData SCALE-encoded `route_executor.sell` call; the two u128 amount
-     *        fields at byte offsets [10..26) and [26..42) are overwritten by `_patchAmounts`.
+     * @param dispatchData Empty to build from the asset-id map, or a SCALE-encoded
+     *        `route_executor.sell` call whose amounts are patched.
      * @return amountOut The amount of `tokenOut` received.
      */
     function sell(
@@ -65,7 +121,8 @@ contract HydraAugustus is IParaSwapAugustus {
         require(amountIn > 0, 'ZERO_AMOUNT_IN');
         require(amountIn <= MAX_UINT128, 'AMOUNT_OVERFLOW_UINT128');
         require(minAmountOut <= MAX_UINT128, 'AMOUNT_OVERFLOW_UINT128');
-        require(dispatchData.length >= MIN_DISPATCH_DATA_LENGTH, 'DISPATCH_DATA_TOO_SHORT');
+
+        bytes memory callData = _buildSellCall(tokenIn, tokenOut, amountIn, minAmountOut, dispatchData);
 
         _safeTransferFrom(tokenIn, msg.sender, address(this), amountIn);
 
@@ -74,7 +131,7 @@ contract HydraAugustus is IParaSwapAugustus {
         _safeApprove(tokenIn, DISPATCH, 0);
         _safeApprove(tokenIn, DISPATCH, amountIn);
 
-        _dispatch(_patchAmounts(dispatchData, amountIn, minAmountOut));
+        _dispatch(callData);
 
         amountOut = _safeBalanceOf(tokenOut, address(this)) - balanceBefore;
         require(amountOut >= minAmountOut, 'INSUFFICIENT_OUTPUT');
@@ -86,12 +143,21 @@ contract HydraAugustus is IParaSwapAugustus {
 
     /**
      * @notice Execute an exact-output swap via the substrate route executor.
+     * @dev Two modes (see `sell`): empty `dispatchData` → build
+     *      `route_executor.buy(assetId[tokenIn], assetId[tokenOut], amountOut, maxAmountIn, [])`
+     *      with an EMPTY route; non-empty → patch amounts into the caller-supplied call.
+     * @dev ⚠️ Param order here is `(maxAmountIn, amountOut)` — the debt-swap adapter
+     *      convention, and the REVERSE of Propeller's `ISwapper.buy(…, amountOut, maxIn, …)`,
+     *      which shares the same 4-arg selector. Propeller only ever calls `sell()`
+     *      (verified: `CollateralVault.compound` is the sole swapper caller), so this
+     *      divergence is intentional. Do NOT route Propeller's `buy` here via the ISwapper
+     *      cast without first aligning the two uint256 args, or they will be swapped silently.
      * @param tokenIn  The token to spend.
      * @param tokenOut The token to receive.
      * @param maxAmountIn The maximum amount of `tokenIn` willing to spend (must fit u128).
      * @param amountOut The exact amount of `tokenOut` desired (must fit u128).
-     * @param dispatchData SCALE-encoded `route_executor.buy` call; the two u128 amount
-     *        fields at byte offsets [10..26) and [26..42) are overwritten by `_patchAmounts`.
+     * @param dispatchData Empty to build from the asset-id map, or a SCALE-encoded
+     *        `route_executor.buy` call whose amounts are patched.
      * @return amountIn The actual amount of `tokenIn` consumed.
      */
     function buy(
@@ -104,7 +170,8 @@ contract HydraAugustus is IParaSwapAugustus {
         require(maxAmountIn > 0, 'ZERO_AMOUNT_IN');
         require(maxAmountIn <= MAX_UINT128, 'AMOUNT_OVERFLOW_UINT128');
         require(amountOut <= MAX_UINT128, 'AMOUNT_OVERFLOW_UINT128');
-        require(dispatchData.length >= MIN_DISPATCH_DATA_LENGTH, 'DISPATCH_DATA_TOO_SHORT');
+
+        bytes memory callData = _buildBuyCall(tokenIn, tokenOut, amountOut, maxAmountIn, dispatchData);
 
         _safeTransferFrom(tokenIn, msg.sender, address(this), maxAmountIn);
 
@@ -114,7 +181,7 @@ contract HydraAugustus is IParaSwapAugustus {
         _safeApprove(tokenIn, DISPATCH, 0);
         _safeApprove(tokenIn, DISPATCH, maxAmountIn);
 
-        _dispatch(_patchAmounts(dispatchData, amountOut, maxAmountIn));
+        _dispatch(callData);
 
         amountIn = balanceInBefore - _safeBalanceOf(tokenIn, address(this));
         uint256 received = _safeBalanceOf(tokenOut, address(this)) - balanceOutBefore;
@@ -127,6 +194,59 @@ contract HydraAugustus is IParaSwapAugustus {
         }
 
         emit Bought(tokenIn, tokenOut, amountIn, received);
+    }
+
+    /**
+     * @dev Build the SCALE call bytes for a sell: from the governance asset-id map with an
+     *      EMPTY route when `dispatchData` is empty (keeper path), else patch the amounts
+     *      into the caller-supplied SCALE call (frontend / debt-swap path).
+     */
+    function _buildSellCall(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        bytes calldata dispatchData
+    ) internal view returns (bytes memory) {
+        if (dispatchData.length == 0) {
+            (uint32 inId, uint32 outId) = _resolveAssetIds(tokenIn, tokenOut);
+            return HydraRouteEncoder.encodeSell(inId, outId, uint128(amountIn), uint128(minAmountOut));
+        }
+        require(dispatchData.length >= MIN_DISPATCH_DATA_LENGTH, 'DISPATCH_DATA_TOO_SHORT');
+        return _patchAmounts(dispatchData, amountIn, minAmountOut);
+    }
+
+    /**
+     * @dev Build the SCALE call bytes for a buy (see `_buildSellCall`).
+     */
+    function _buildBuyCall(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountOut,
+        uint256 maxAmountIn,
+        bytes calldata dispatchData
+    ) internal view returns (bytes memory) {
+        if (dispatchData.length == 0) {
+            (uint32 inId, uint32 outId) = _resolveAssetIds(tokenIn, tokenOut);
+            return HydraRouteEncoder.encodeBuy(inId, outId, uint128(amountOut), uint128(maxAmountIn));
+        }
+        require(dispatchData.length >= MIN_DISPATCH_DATA_LENGTH, 'DISPATCH_DATA_TOO_SHORT');
+        return _patchAmounts(dispatchData, amountOut, maxAmountIn);
+    }
+
+    /**
+     * @dev Resolve the substrate asset ids for a token pair. Both must be registered
+     *      (non-zero) via `setAssetId`; HDX (asset 0) is intentionally not reachable
+     *      through the empty-`dispatchData` path.
+     */
+    function _resolveAssetIds(address tokenIn, address tokenOut)
+        internal
+        view
+        returns (uint32 inId, uint32 outId)
+    {
+        inId = assetId[tokenIn];
+        outId = assetId[tokenOut];
+        require(inId != 0 && outId != 0, 'ASSET_NOT_REGISTERED');
     }
 
     /**

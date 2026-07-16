@@ -17,9 +17,9 @@ contract HydraAugustusTest is Test {
 
     uint32 internal constant ASSET_ID_A = 1;
     uint32 internal constant ASSET_ID_B = 2;
-    uint8 internal constant SELL_CALL_INDEX = 0;
-    uint8 internal constant BUY_CALL_INDEX = 1;
-    uint8 internal constant PALLET_INDEX = 42;
+    uint8 internal constant SELL_CALL_INDEX = 0; // pallet_route::Call::sell (mainnet-verified, DcaDispatch.SELL_CALL)
+    uint8 internal constant BUY_CALL_INDEX = 1; // pallet_route::Call::buy (conventional ordering; confirm vs runtime metadata)
+    uint8 internal constant PALLET_INDEX = 67; // Hydration Router pallet (construct_runtime: Router = 67, DcaDispatch.ROUTER_PALLET)
 
     address internal caller;
 
@@ -34,11 +34,68 @@ contract HydraAugustusTest is Test {
         mockDispatch.setAssetMapping(ASSET_ID_B, address(tokenB));
         mockDispatch.setRate(1e18, 1e18);
 
+        // register the same asset ids in the adapter for the empty-route (built) path
+        augustus.setAssetId(address(tokenA), ASSET_ID_A);
+        augustus.setAssetId(address(tokenB), ASSET_ID_B);
+
         caller = address(0xA11CE);
     }
 
     function test_getTokenTransferProxy() public {
         assertEq(augustus.getTokenTransferProxy(), address(augustus));
+    }
+
+    // ── empty-route path: adapter builds the call from the asset-id map ────
+
+    function test_sell_emptyRoute_buildsFromAssetIdMap() public {
+        uint256 amountIn = 1000e18;
+        uint256 minAmountOut = 900e18;
+
+        tokenA.mint(caller, amountIn);
+        tokenB.mint(address(mockDispatch), amountIn);
+
+        vm.startPrank(caller);
+        tokenA.approve(address(augustus), amountIn);
+
+        // empty dispatchData -> adapter builds route_executor.sell with an empty route
+        uint256 amountOut = augustus.sell(address(tokenA), address(tokenB), amountIn, minAmountOut, '');
+        vm.stopPrank();
+
+        assertEq(amountOut, amountIn);
+        assertEq(tokenB.balanceOf(caller), amountIn);
+        assertEq(tokenA.balanceOf(address(augustus)), 0);
+        assertEq(tokenB.balanceOf(address(augustus)), 0);
+    }
+
+    function test_buy_emptyRoute_buildsFromAssetIdMap() public {
+        uint256 amountOut = 500e18;
+        uint256 maxAmountIn = 600e18;
+
+        tokenA.mint(caller, maxAmountIn);
+        tokenB.mint(address(mockDispatch), amountOut);
+
+        vm.startPrank(caller);
+        tokenA.approve(address(augustus), maxAmountIn);
+
+        uint256 amountIn = augustus.buy(address(tokenA), address(tokenB), maxAmountIn, amountOut, '');
+        vm.stopPrank();
+
+        assertEq(amountIn, amountOut); // rate 1:1
+        assertEq(tokenB.balanceOf(caller), amountOut);
+        assertEq(tokenA.balanceOf(caller), maxAmountIn - amountIn); // leftover refunded
+        assertEq(tokenA.balanceOf(address(augustus)), 0);
+        assertEq(tokenB.balanceOf(address(augustus)), 0);
+    }
+
+    function test_revert_sell_emptyRoute_assetNotRegistered() public {
+        MockERC20 tokenC = new MockERC20('Token C', 'TKC', 18); // never registered
+        tokenC.mint(caller, 1e18);
+
+        vm.startPrank(caller);
+        tokenC.approve(address(augustus), 1e18);
+        vm.expectRevert(bytes('ASSET_NOT_REGISTERED'));
+        augustus.sell(address(tokenC), address(tokenB), 1e18, 1e18, '');
+        vm.stopPrank();
     }
 
     function test_sell_basic() public {

@@ -14,6 +14,7 @@ const NETWORK = process.env.HYDRA_NETWORK || "lark";
 
 const RPC_URLS: Record<string, string> = {
   zombie: "http://localhost:8645",
+  chopsticks: "http://localhost:8000",
   lark: "https://node.lark.hydration.cloud",
   nice: "https://rpc.nice.hydration.cloud",
   hydration: "https://rpc.hydradx.cloud",
@@ -40,6 +41,7 @@ const HDX_ID = 0;
 
 const WS_URLS: Record<string, string> = {
   zombie: "ws://localhost:8000",
+  chopsticks: "ws://localhost:8000",
   lark: "wss://node.lark.hydration.cloud",
   nice: "wss://rpc.nice.hydration.cloud",
   hydration: "wss://rpc.hydradx.cloud",
@@ -348,7 +350,16 @@ async function submitAndWait(
   });
 }
 
-async function executeViaSudoOrGovernance(
+async function devNewBlock(api: ApiPromise, count: number): Promise<boolean> {
+  try {
+    await (api.rpc as any)("dev_newBlock", { count });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function executeViaGovernance(
   api: ApiPromise,
   signer: any,
   batch: any,
@@ -357,20 +368,22 @@ async function executeViaSudoOrGovernance(
   const encodedCall = batch.method.toHex();
   const encodedHash = blake2AsHex(encodedCall);
   const encodedLen = encodedCall.length / 2 - 1;
+  const hasDev = await devNewBlock(api, 1);
 
+  console.log(`  [${label}] Using governance (dev_newBlock: ${hasDev ? "available" : "NOT available"})...`);
+
+  // notePreimage may already exist from a previous run — skip if AlreadyNoted
   try {
-    console.log(`  [${label}] Trying sudo...`);
-    const sudoTx = api.tx.sudo.sudo(batch);
-    await submitAndWait(sudoTx, signer, api, "sudo.sudo");
-    console.log(`  [${label}] Done via sudo`);
-    return;
-  } catch (sudoErr: any) {
-    console.log(`  [${label}] Sudo not available (${sudoErr.message}), using governance...`);
+    await submitAndWait(
+      api.tx.preimage.notePreimage(encodedCall), signer, api, "notePreimage"
+    );
+  } catch (err: any) {
+    if (err.message?.includes("AlreadyNoted")) {
+      console.log(`    notePreimage: already noted, skipping`);
+    } else {
+      throw err;
+    }
   }
-
-  await submitAndWait(
-    api.tx.preimage.notePreimage(encodedCall), signer, api, "notePreimage"
-  );
   await submitAndWait(
     api.tx.referenda.submit(
       { system: "Root" },
@@ -397,38 +410,38 @@ async function executeViaSudoOrGovernance(
     signer, api, "vote"
   );
 
-  // Try to advance blocks on dev nodes
-  try {
-    for (let i = 0; i < 5; i++) {
-      await (api.rpc as any).engine.createBlock(true, true);
+  if (hasDev) {
+    // On chopsticks/zombie: advance blocks to push through decision + confirmation + enactment.
+    // Alice's massive HDX balance exceeds the 36% support threshold so the referendum
+    // can pass as soon as the approval/support curves are satisfied.
+    console.log(`  [${label}] Advancing blocks via dev_newBlock...`);
+    await devNewBlock(api, 10);
+
+    // Verify enactment — keep advancing if still Ongoing/Approved
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const info = (await api.query.referenda.referendumInfoFor(refIndex)).toHuman() as any;
+      if (!info?.Ongoing && !info?.Approved) {
+        console.log(`  [${label}] Referendum ${refIndex} enacted: ${JSON.stringify(info)}`);
+        return;
+      }
+      console.log(`  [${label}] Still ${info?.Ongoing ? "Ongoing" : "Approved"}, advancing more blocks...`);
+      await devNewBlock(api, 50);
     }
-  } catch {
-    try {
-      await (api.rpc as any)("dev_newBlock", { count: 10 });
-    } catch {
-      // Not a dev node — fall through to polling
-    }
+    throw new Error(`[${label}] Referendum ${refIndex} did not enact after block advancement`);
   }
 
-  // Poll referendum status until enacted or timeout
-  console.log(`  [${label}] Waiting for referendum ${refIndex} to enact...`);
+  // On live networks (lark, nice, hydration): poll until enacted or timeout
+  console.log(`  [${label}] Waiting for referendum ${refIndex} to enact (this may take a while on live networks)...`);
   const pollStart = Date.now();
   const ENACTMENT_TIMEOUT_MS = 180_000; // 3 minutes
   while (Date.now() - pollStart < ENACTMENT_TIMEOUT_MS) {
     const info = (await api.query.referenda.referendumInfoFor(refIndex)).toHuman() as any;
-    if (info?.Approved) {
-      process.stdout.write(".");
-      await new Promise((r) => setTimeout(r, 6_000));
-      continue;
+    if (!info?.Ongoing && !info?.Approved) {
+      console.log(`\n  [${label}] Referendum ${refIndex} final status: ${JSON.stringify(info)}`);
+      return;
     }
-    if (info?.Ongoing) {
-      process.stdout.write(".");
-      await new Promise((r) => setTimeout(r, 6_000));
-      continue;
-    }
-    // Confirmed, Rejected, TimedOut, Cancelled, Killed — all terminal
-    console.log(`\n  [${label}] Referendum ${refIndex} final status: ${JSON.stringify(info)}`);
-    return;
+    process.stdout.write(".");
+    await new Promise((r) => setTimeout(r, 6_000));
   }
   console.log(`\n  [${label}] Referendum ${refIndex} still pending after ${ENACTMENT_TIMEOUT_MS / 1000}s — continuing anyway`);
 }
@@ -445,8 +458,9 @@ async function fundAliceViaGovernance(evmAddress: string): Promise<void> {
   const aliceSr25519 = keyring.addFromUri("//Alice");
   const truncated = evmTruncatedAccount(evmAddress);
 
-  // Mint tokens to Alice's EVM-mapped substrate account
+  // Mint tokens to Alice's EVM-mapped substrate account (including HDX for EVM gas)
   const mints: { symbol: string; assetId: number; amount: string }[] = [
+    { symbol: "HDX",  assetId: 0,             amount: "1000000000000000000" }, // 1M HDX (12 dec) for EVM gas
     { symbol: "DOT",  assetId: TOKENS.DOT.id, amount: ethers.utils.parseUnits("1000", TOKENS.DOT.decimals).toString() },
     { symbol: "USDC", assetId: TOKENS.USDC.id, amount: ethers.utils.parseUnits("10000", TOKENS.USDC.decimals).toString() },
   ];
@@ -457,8 +471,12 @@ async function fundAliceViaGovernance(evmAddress: string): Promise<void> {
     calls.push(api.tx.currencies.updateBalance(truncated, mint.assetId, mint.amount));
   }
 
+  // Whitelist as contract deployer (needed on fresh forks)
+  console.log(`  Will whitelist ${evmAddress} as contract deployer`);
+  calls.push(api.tx.evmAccounts.addContractDeployer(evmAddress));
+
   const batch = api.tx.utility.batchAll(calls);
-  await executeViaSudoOrGovernance(api, aliceSr25519, batch, "Fund Alice");
+  await executeViaGovernance(api, aliceSr25519, batch, "Fund Alice");
 
   await api.disconnect();
 }
@@ -488,7 +506,7 @@ async function seedDexLiquidity(): Promise<void> {
     api.tx.currencies.updateBalance(aliceSr25519.address, TOKENS.USDC.id, usdcAmount),
   ];
   const mintBatch = api.tx.utility.batchAll(mintCalls);
-  await executeViaSudoOrGovernance(api, aliceSr25519, mintBatch, "Mint for XYK");
+  await executeViaGovernance(api, aliceSr25519, mintBatch, "Mint for XYK");
 
   // Seed XYK pools — try addLiquidity with MAX_LIMIT, fallback to createPool
   const pools: { a: number; b: number; amountA: string; amountB: string; label: string }[] = [
@@ -514,6 +532,43 @@ async function seedDexLiquidity(): Promise<void> {
       }
     }
   }
+
+  await api.disconnect();
+}
+
+const POOL_CONFIGURATOR_ABI = [
+  "function setReserveFlashLoaning(address asset, bool enabled)",
+];
+
+async function enableFlashLoans(): Promise<void> {
+  const wsUrl = WS_URLS[NETWORK];
+  if (!wsUrl) throw new Error(`No WS URL for network: ${NETWORK}`);
+
+  console.log(`  Connecting to ${wsUrl}...`);
+  const wsProvider = new WsProvider(wsUrl);
+  const api = await ApiPromise.create({ provider: wsProvider, noInitWarn: true });
+
+  const keyring = new Keyring({ type: "sr25519" });
+  const aliceSr25519 = keyring.addFromUri("//Alice");
+
+  const iface = new ethers.utils.Interface(POOL_CONFIGURATOR_ABI);
+  const calls: any[] = [];
+
+  for (const [symbol, token] of Object.entries(TOKENS)) {
+    const data = iface.encodeFunctionData("setReserveFlashLoaning", [token.address, true]);
+    const evmCall = api.tx.evm.call(
+      AAVE.poolAdmin,
+      AAVE.poolConfigurator,
+      data,
+      "0", "600000", "600000000",
+      undefined, undefined, [], []
+    );
+    calls.push(api.tx.dispatcher.dispatchAsAaveManager(evmCall));
+    console.log(`  Will enable flash loans for ${symbol}`);
+  }
+
+  const batch = api.tx.utility.batchAll(calls);
+  await executeViaGovernance(api, aliceSr25519, batch, "Enable Flash Loans");
 
   await api.disconnect();
 }
@@ -568,12 +623,21 @@ async function main() {
   const flashLoanUSDC = await checkFlashLoanEnabled(pool, TOKENS.USDC.address);
   console.log(`  DOT flash loan:  ${flashLoanDOT ? "ENABLED" : "DISABLED"}`);
   console.log(`  USDC flash loan: ${flashLoanUSDC ? "ENABLED" : "DISABLED"}`);
-  const canDebtSwap = flashLoanDOT && flashLoanUSDC;
+  let canDebtSwap = flashLoanDOT && flashLoanUSDC;
   if (!canDebtSwap) {
-    console.log(
-      "  Debt swap requires flash loans. Run governance script first:\n" +
-        `    HYDRA_NETWORK=${NETWORK} npx ts-node scripts/governance-flash-loans.ts --full-flow`
-    );
+    console.log("  Flash loans not enabled — enabling via governance...");
+    await enableFlashLoans();
+    // Re-check
+    canDebtSwap = await checkFlashLoanEnabled(pool, TOKENS.DOT.address)
+      && await checkFlashLoanEnabled(pool, TOKENS.USDC.address);
+    if (canDebtSwap) {
+      console.log("  Flash loans enabled successfully");
+    } else {
+      console.log(
+        "  Flash loans still not enabled (governance may be pending on live networks).\n" +
+          "  Debt swap test will be skipped."
+      );
+    }
   }
 
   // ───────────────────────────────────────────

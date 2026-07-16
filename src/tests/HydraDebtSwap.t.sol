@@ -22,8 +22,8 @@ contract HydraDebtSwapTest is BaseTest {
 
     uint32 internal constant LUSD_ASSET_ID = 1;
     uint32 internal constant DAI_ASSET_ID = 2;
-    uint8 internal constant BUY_CALL_INDEX = 1;
-    uint8 internal constant PALLET_INDEX = 42;
+    uint8 internal constant BUY_CALL_INDEX = 1; // pallet_route::Call::buy (conventional ordering; confirm vs runtime metadata)
+    uint8 internal constant PALLET_INDEX = 67; // Hydration Router pallet (construct_runtime: Router = 67, DcaDispatch.ROUTER_PALLET)
 
     function setUp() public override {
         super.setUp();
